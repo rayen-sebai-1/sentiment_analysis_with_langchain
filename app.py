@@ -6,6 +6,8 @@ import pandas as pd
 
 from langchain_groq import ChatGroq
 from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from langchain_core.runnables import RunnableParallel, RunnableLambda
 
 
 # =========================================================
@@ -45,7 +47,6 @@ def get_llm(
         )
         st.stop()
 
-
     llm = ChatGroq(
         model=model,
         temperature=temperature,
@@ -58,29 +59,51 @@ def get_llm(
 
 
 # =========================================================
-# 2) CORE LOGIC
+# 2) CORE LOGIC (RUNNABLES)
 # =========================================================
 
+def build_analyzer(llm: ChatGroq):
+    """
+    Returns a Runnable that:
+    - takes {"text": "..."}
+    - runs sentiment/topic/followup in parallel
+    - returns {"sentiment": "...", "main_topic": "...", "followup_question": "..."}
+    """
+    parser = StrOutputParser()
+
+    sentiment_chain = sentiment_template | llm | parser
+    main_topic_chain = main_topic_template | llm | parser
+    followup_chain = followup_template | llm | parser
+
+    parallel = RunnableParallel(
+        sentiment=sentiment_chain,
+        main_topic=main_topic_chain,
+        followup_question=followup_chain,
+    )
+
+    # Small post-processing step to normalize whitespace
+    def _clean(d: Dict[str, str]) -> Dict[str, str]:
+        return {k: (v or "").strip() for k, v in d.items()}
+
+    return parallel | RunnableLambda(_clean)
+
+
 def analyze_statements(llm: ChatGroq, statements: List[str]) -> List[Dict[str, Any]]:
-    # Build prompts
-    sentiment_prompts = [sentiment_template.format_messages(text=s) for s in statements]
-    main_topic_prompts = [main_topic_template.format_messages(text=s) for s in statements]
-    followup_prompts = [followup_template.format_messages(text=s) for s in statements]
+    analyzer = build_analyzer(llm)
 
-    # Batch calls
-    sentiments = llm.batch(sentiment_prompts)
-    main_topics = llm.batch(main_topic_prompts)
-    followups = llm.batch(followup_prompts)
+    # batch inputs -> list[dict]
+    inputs = [{"text": s} for s in statements]
+    outputs = analyzer.batch(inputs)
 
-    # Return structured results
+    # Attach original statement to each row
     results: List[Dict[str, Any]] = []
-    for statement, sentiment, main_topic, followup in zip(statements, sentiments, main_topics, followups):
+    for statement, out in zip(statements, outputs):
         results.append(
             {
                 "statement": statement,
-                "sentiment": (sentiment.content or "").strip(),
-                "main_topic": (main_topic.content or "").strip(),
-                "followup_question": (followup.content or "").strip(),
+                "sentiment": out.get("sentiment", ""),
+                "main_topic": out.get("main_topic", ""),
+                "followup_question": out.get("followup_question", ""),
             }
         )
     return results
